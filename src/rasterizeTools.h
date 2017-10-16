@@ -95,7 +95,29 @@ bool isBarycentricCoordInBounds(const glm::vec3 barycentricCoord) {
  */
 __host__ __device__ static
 float getZAtCoordinate(const glm::vec3 barycentricCoord, const glm::vec3 tri[3]) {
-    return -(barycentricCoord.x * tri[0].z
+    return (barycentricCoord.x * tri[0].z
            + barycentricCoord.y * tri[1].z
            + barycentricCoord.z * tri[2].z);
+}
+
+// Thanks to Jin Kim and Adam Mally for explaining perspective correction
+__host__ __device__ static
+float getZAtCoordinatePersp(const glm::vec3 bary, const glm::vec3 tri[3]) {
+	return 1.0f / (bary.x / tri[0].z + bary.y / tri[1].z + bary.z / tri[2].z);
+}
+
+// get a barycentric interpolated vector with perspective correction
+__host__ __device__ static
+glm::vec3 getPerspectiveInterpolatedVector(const glm::vec3 bary, const glm::vec3 triAttr[3], const glm::vec3 tri[3], const float zCorrect) {
+	return zCorrect * glm::vec3(triAttr[0] * bary.x / tri[0].z +
+		triAttr[1] * bary.y / tri[1].z +
+		triAttr[2] * bary.z / tri[2].z);
+}
+
+__host__ __device__ static
+glm::vec3 getPerspectiveInterpolatedVector(const glm::vec3 bary, const glm::vec3 triAttr[3], const glm::vec3 tri[3]) {
+	float zCorrect = getZAtCoordinatePersp(bary, tri);
+	return zCorrect * glm::vec3(triAttr[0] * bary.x / tri[0].z +
+		triAttr[1] * bary.y / tri[1].z +
+		triAttr[2] * bary.z / tri[2].z);
 }
