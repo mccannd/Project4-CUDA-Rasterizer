@@ -105,20 +105,7 @@ static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
 
 static int * dev_depth = NULL;	// you might need this buffer when doing depth test
-
-__host__ __device__ static
-glm::vec3 getEyePosAtCoordinate(const glm::vec3 barycentricCoord, const Primitive pri) {
-	return (barycentricCoord.x * pri.v[0].eyePos
-		+ barycentricCoord.y * pri.v[1].eyePos
-		+ barycentricCoord.z * pri.v[2].eyePos);
-}
-
-__host__ __device__ static
-glm::vec3 getEyeNorAtCoordinate(const glm::vec3 barycentricCoord, const Primitive pri) {
-	return (barycentricCoord.x * pri.v[0].eyeNor
-		+ barycentricCoord.y * pri.v[1].eyeNor
-		+ barycentricCoord.z * pri.v[2].eyeNor);
-}
+static int * dev_fragMutex = NULL;
 
 
 /**
@@ -195,6 +182,9 @@ void rasterizeInit(int w, int h) {
 	cudaFree(dev_depth);
 	cudaMalloc(&dev_depth, width * height * sizeof(int));
 
+	cudaFree(dev_fragMutex);
+	cudaMalloc(&dev_fragMutex, width * height * sizeof(int));
+
 	checkCUDAError("rasterizeInit");
 }
 
@@ -211,6 +201,18 @@ void initDepth(int w, int h, int * depth)
 	}
 }
 
+
+__global__ 
+void initMutex(int w, int h, int * mutex) {
+	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+
+	if (x < w && y < h)
+	{
+		int index = x + (y * w);
+		mutex[index] = 0;
+	}
+}
 
 /**
 * kern function with support for stride to sometimes replace cudaMemcpy
@@ -710,7 +712,7 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 }
 // parallelize rasterization by triangle
 __global__ void _rasterizeTriangle(const int numTris, const Primitive* primitives, 
-	Fragment* frags, int* depthBuffer, const int width, const int height) {
+	Fragment* frags, int* depthBuffer, const int width, const int height, int * mutex) {
 
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (idx >= numTris) return;
@@ -742,6 +744,24 @@ __global__ void _rasterizeTriangle(const int numTris, const Primitive* primitive
 			// hacky cull backface
 			if (glm::dot(interNor, glm::vec3(0, 0, 1)) > 0 && depth < depthBuffer[pxIdx]) {
 
+				bool isSet;
+				do {
+					isSet = (atomicCAS(&mutex[pxIdx], 0, 1) == 0);
+					if (isSet) {
+						if (depthBuffer[pxIdx] > depth) {
+							// replaced fragment with this triangle
+							frags[pxIdx].color = interNor;
+							frags[pxIdx].eyeNor = interNor;
+							frags[pxIdx].eyePos = interPos;
+							depthBuffer[pxIdx] = depth;
+						}				
+					}
+					if (isSet) {
+						mutex[pxIdx] = 0;
+					}
+				} while (!isSet);
+
+				/*
 				//simple depth test
 				atomicMin(&depthBuffer[pxIdx], depth);
 
@@ -750,7 +770,7 @@ __global__ void _rasterizeTriangle(const int numTris, const Primitive* primitive
 					frags[pxIdx].color = interNor;
 					frags[pxIdx].eyeNor = interNor;
 					frags[pxIdx].eyePos = interPos;
-				}
+				}*/
 			}
 
 		}
@@ -804,13 +824,14 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
 	initDepth << <blockCount2d, blockSize2d >> >(width, height, dev_depth);
 	checkCUDAError("init depth");
-	// TODO: rasterize
+	initMutex << < blockCount2d, blockSize2d >> > (width, height, dev_fragMutex);
+	checkCUDAError("init mutex");
+
 	const int numThreads = 128;
 	dim3 triBlockCount = (totalNumPrimitives + numThreads - 1) / numThreads;
-	//(const int numTris, const Primitive* primitives, 
-	//Fragment* frags, int* depthBuffer, const int width, const int height) {
 
-	_rasterizeTriangle << < triBlockCount, numThreads >> > (totalNumPrimitives, dev_primitives, dev_fragmentBuffer, dev_depth, width, height);
+	_rasterizeTriangle << < triBlockCount, numThreads >> > (totalNumPrimitives, dev_primitives, dev_fragmentBuffer, 
+		dev_depth, width, height, dev_fragMutex);
 	checkCUDAError("rasterize tris");
 
 
@@ -859,6 +880,9 @@ void rasterizeFree() {
 
 	cudaFree(dev_depth);
 	dev_depth = NULL;
+
+	cudaFree(dev_fragMutex);
+	dev_fragMutex = NULL;
 
     checkCUDAError("rasterize Free");
 }
