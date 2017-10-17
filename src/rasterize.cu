@@ -18,6 +18,9 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+
+#define BLOOM 1
+
 namespace {
 
 	typedef unsigned short VertexIndex;
@@ -104,7 +107,14 @@ static Primitive *dev_primitives = NULL;
 static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
 
-static int * dev_depth = NULL;	// you might need this buffer when doing depth test
+#if BLOOM
+
+static glm::vec3 *dev_bloom1 = NULL;
+static glm::vec3 *dev_bloom2 = NULL;
+
+#endif
+
+static int * dev_depth = NULL;
 static int * dev_fragMutex = NULL;
 
 
@@ -130,6 +140,162 @@ void sendImageToPBO(uchar4 *pbo, int w, int h, glm::vec3 *image) {
     }
 }
 
+__global__
+void toneMap(const int w, const int h, glm::vec3 *framebuffer, const float gamma, const float exposure) {
+	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+	int index = x + (y * w);
+
+	if (x < w && y < h) {
+		glm::vec3 col = framebuffer[index];
+		//col = glm::pow(col, glm::vec3(1.0f / gamma));
+		col = glm::vec3(1.0f) - glm::exp(-exposure * col);
+		col = glm::pow(col, glm::vec3(1.0f / gamma));
+		framebuffer[index] = col;
+	}
+}
+
+#if BLOOM
+
+// check for color components above 1, transfer to buffer with half res
+__global__
+void bloomHighPass(int wHalf, int hHalf, const glm::vec3 *framebuffer, glm::vec3 *bloombuffer) {
+	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+	int bloomIdx = x + y * wHalf;
+
+	if (x < wHalf && y < hHalf) {
+		glm::vec3 col = glm::vec3(0);
+		// get avg of 4 px from framebuffer
+		for (int yOff = 0; yOff <= 1; yOff++) {
+			for (int xOff = 0; xOff <= 1; xOff++) {
+				int x2 = 2 * x + xOff;
+				int y2 = 2 * y + yOff;
+
+				int fbIdx = x2 + y2 * (2 * wHalf);
+				glm::vec3 fbCol = framebuffer[fbIdx];
+
+				float intensity = dot(fbCol, fbCol);
+				intensity -= 3.f; // threshold
+				intensity *= 0.5f; // stretch response curve
+				intensity = intensity < 0.f ? 0.f : intensity;
+				intensity = intensity > 1.f ? 1.f : intensity;
+
+				intensity = intensity * intensity * (3.f - 2.f * intensity); // smoothstep
+				/*
+	// Scale, bias and saturate x to 0..1 range
+    x = clamp((x - edge0)/(edge1 - edge0), 0.0, 1.0); 
+    // Evaluate polynomial
+    return x*x*(3 - 2*x);
+	*/
+
+				fbCol = intensity * fbCol;
+
+				col += 0.25f * fbCol;
+			}
+		}
+		bloombuffer[bloomIdx] = col;
+	}
+}
+	//uniform float offset[3] = float[](0.0, 1.3846153846, 3.2307692308);
+	//uniform float weight[3] = float[](0.2270270270, 0.3162162162, 0.0702702703);
+
+
+/*	uniform float offset[5] = float[]( 0.0, 1.0, 2.0, 3.0, 4.0 );
+06
+	uniform float weight[5] = float[]( 0.2270270270, 0.1945945946, 0.1216216216,
+07
+	                                   0.0540540541, 0.0162162162 );*/
+
+__global__
+void bloomHorizontalGather(int w, int h, const glm::vec3 *bufIn, glm::vec3 *bufOut) {
+	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+	int idx = x + y * w;
+
+	if (x < w && y < h) {
+		// close approximation by Rastergrid, efficient gaussian blur with linear sampling
+		float weight[5] = { 0.227027027f, 0.194594595f, 0.121621622f, 0.054054054f, 0.016216216f};
+		int offset[5] = { 0, 1, 2, 3, 4 };
+		glm::vec3 col = bufIn[idx] * weight[0];
+		for (int i = 1; i < 5; i++) {
+			int prev = x - offset[i];
+			int next = x + offset[i];
+			prev = prev < 0 ? 0 : prev;
+			next = next >= w ? w - 1 : next;
+
+			col += weight[i] * bufIn[prev + y * w];
+			col += weight[i] * bufIn[next + y * w];
+		}
+
+		bufOut[idx] = col;
+	}
+}
+
+__global__ 
+void bloomVerticalGather(int w, int h, const glm::vec3 *bufIn, glm::vec3 *bufOut) {
+	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+	int idx = x + y * w;
+
+	if (x < w && y < h) {
+		// close approximation by Rastergrid, efficient gaussian blur with linear sampling
+		float weight[5] = { 0.227027027f, 0.194594595f, 0.121621622f, 0.054054054f, 0.016216216f };
+		int offset[5] = { 0, 1, 2, 3, 4 };
+		glm::vec3 col = bufIn[idx] * weight[0];
+		for (int i = 1; i < 5; i++) {
+			int prev = y - offset[i];
+			int next = y + offset[i];
+			prev = prev < 0 ? 0 : prev;
+			next = next >= h ? h - 1 : next;
+
+			col += weight[i] * bufIn[x + prev * w];
+			col += weight[i] * bufIn[x + next * w];
+		}
+
+		bufOut[idx] = col;
+	}
+}
+
+__global__
+void bloomComposite(int w, int h, glm::vec3 *framebuffer, const glm::vec3 *bloombuffer) {
+	// going to "bilinear upsample" the bloomBuffer to get composite color
+	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+	int idx = x + y * w;
+
+	if (x < w && y < h) {
+		// get 4 samples of bloom buffer and interpolate
+		// if the current px is odd, it's in latter half
+		float wx = x & 1 ? 0.75f : 0.25f;
+		float wy = y & 1 ? 0.75f : 0.25f;
+
+		int wb = w / 2;
+		int hb = h / 2;
+		int xb = x / 2;
+		int yb = y / 2;
+		int idxb = xb + yb * wb;
+
+		int x0 = x & 1 ? (xb) : (xb > 0 ? xb - 1 : 0);
+		int x1 = x & 1 ? (xb >= (wb - 1) ? wb - 1 : xb + 1) : (xb);
+
+		int y0 = y & 1 ? (yb) : (yb > 0 ? yb - 1 : 0);
+		int y1 = y & 1 ? (yb >= (hb - 1) ? hb - 1 : yb + 1) : (yb);
+
+		glm::vec3 col00, col01, col10, col11;
+
+		col00 = bloombuffer[x0 + y0 * wb];
+		col01 = bloombuffer[x1 + y0 * wb];
+		col10 = bloombuffer[x0 + y1 * wb];
+		col11 = bloombuffer[x1 + y1 * wb];
+
+		// add the color, HDR is resolved by tone mapping
+		framebuffer[idx] += wy * (wx * col00 + (1.f - wx) * col01) + (1.f - wy) * (wx * col10 + (1.f - wx) * col11);
+	}
+}
+
+#endif
+
 /** 
 * Writes fragment colors to the framebuffer
 */
@@ -146,21 +312,38 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
 			return;
 		}
 
+		glm::vec3 lightDir[3] = { 
+			glm::normalize(glm::vec3(1)),
+			glm::normalize(glm::vec3(-1, -0.1, -0.8)),
+			glm::normalize(glm::vec3(0, -1, 0)) 
+		};
+
+		float lightIntensity[3] = { 
+			1.5f, 0.3f, 0.2f 
+		};
+
+		glm::vec3 lightCol[3] = {
+			glm::vec3(1.0f, 0.9f, 0.7f),
+			glm::vec3(0.8f, 0.9f, 1.0f),
+			glm::vec3(0.4f, 1.0f, 0.5f)
+		};
+
+
 		// simple blinn phong
-		glm::vec3 col;
+		glm::vec3 col = glm::vec3(0);
 		glm::vec3 nor = fragmentBuffer[index].eyeNor;
 		//glm::vec3 lightPos = glm::vec3(5, 5, 5);
 		//glm::vec3 lightDir = glm::normalize(lightPos - fragmentBuffer[index].eyePos);
-		glm::vec3 lightDir = glm::normalize(glm::vec3(1));
-		glm::vec3 halfVec = glm::normalize(lightDir - glm::normalize(fragmentBuffer[index].eyePos));
+		for (int i = 0; i < 3; i++) {
+			glm::vec3 halfVec = glm::normalize(lightDir[i] - glm::normalize(fragmentBuffer[index].eyePos));
 
-		float kd = 0.2f;
-		float lambert = kd * glm::dot(nor, lightDir);
-		lambert = lambert < 0 ? 0 : lambert;
-		float blinn = (1.0f - kd) * pow(glm::dot(halfVec, nor), 64.0f);
-		blinn = blinn < 0 ? 0 : blinn;
+			float lambert = glm::dot(nor, lightDir[i]);
+			lambert = lambert < 0 ? 0 : lambert;
+			float blinn = pow(glm::dot(halfVec, nor), 64.0f);
+			blinn = blinn < 0 ? 0 : blinn;
 
-		col = glm::vec3(blinn + lambert);
+			col += lightIntensity[i] * lightCol[i] * glm::vec3(blinn + lambert);
+		}
 
 		framebuffer[index] = col;
     }
@@ -184,6 +367,15 @@ void rasterizeInit(int w, int h) {
 
 	cudaFree(dev_fragMutex);
 	cudaMalloc(&dev_fragMutex, width * height * sizeof(int));
+
+#if BLOOM
+	cudaFree(dev_bloom1);
+	cudaFree(dev_bloom2);
+	cudaMalloc(&dev_bloom1, width * height / 4 * sizeof(glm::vec3));
+	cudaMalloc(&dev_bloom2, width * height / 4 * sizeof(glm::vec3));
+	cudaMemset(dev_bloom1, 0, width * height / 4 * sizeof(glm::vec3));
+	cudaMemset(dev_bloom2, 0, width * height / 4 * sizeof(glm::vec3));
+#endif
 
 	checkCUDAError("rasterizeInit");
 }
@@ -694,21 +886,13 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 	int iid = (blockIdx.x * blockDim.x) + threadIdx.x;
 
 	if (iid < numIndices) {
-
-		// TODO: uncomment the following code for a start
-		// This is primitive assembly for triangles
-
 		int pid;	// id for cur primitives vector
 		if (primitive.primitiveMode == TINYGLTF_MODE_TRIANGLES) {
 			pid = iid / (int)primitive.primitiveType;
 			dev_primitives[pid + curPrimitiveBeginId].v[iid % (int)primitive.primitiveType]
 				= primitive.dev_verticesOut[primitive.dev_indices[iid]];
 		}
-
-
-		// TODO: other primitive types (point, line)
 	}
-	
 }
 // parallelize rasterization by triangle
 __global__ void _rasterizeTriangle(const int numTris, const Primitive* primitives, 
@@ -760,19 +944,7 @@ __global__ void _rasterizeTriangle(const int numTris, const Primitive* primitive
 						mutex[pxIdx] = 0;
 					}
 				} while (!isSet);
-
-				/*
-				//simple depth test
-				atomicMin(&depthBuffer[pxIdx], depth);
-
-				if (depthBuffer[pxIdx] == depth) {
-					// replaced fragment with this triangle
-					frags[pxIdx].color = interNor;
-					frags[pxIdx].eyeNor = interNor;
-					frags[pxIdx].eyePos = interPos;
-				}*/
 			}
-
 		}
 	}
 }
@@ -785,6 +957,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
     dim3 blockSize2d(sideLength2d, sideLength2d);
     dim3 blockCount2d((width  - 1) / blockSize2d.x + 1,
 		(height - 1) / blockSize2d.y + 1);
+
 
 	// Execute your rasterization pipeline here
 	// (See README for rasterization pipeline outline.)
@@ -834,10 +1007,34 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 		dev_depth, width, height, dev_fragMutex);
 	checkCUDAError("rasterize tris");
 
+	
 
     // Copy depthbuffer colors into framebuffer
 	render << <blockCount2d, blockSize2d >> >(width, height, dev_fragmentBuffer, dev_framebuffer);
 	checkCUDAError("fragment shader");
+
+#if BLOOM
+	// make downsampled high pass
+	dim3 blockDownsampleCount2d((width / 2 - 1) / blockSize2d.x + 1,
+		(height / 2 - 1) / blockSize2d.y + 1);
+
+	// void bloomHighPass(int wHalf, int hHalf, glm::vec3 *framebuffer, glm::vec3 *bloombuffer) {
+	bloomHighPass << < blockDownsampleCount2d, blockSize2d >> > (width / 2, height / 2, dev_framebuffer, dev_bloom1);
+
+	// apply gaussian
+	bloomHorizontalGather << < blockDownsampleCount2d, blockSize2d >> >(width / 2, height / 2, dev_bloom1, dev_bloom2);
+	bloomVerticalGather << < blockDownsampleCount2d, blockSize2d >> >(width / 2, height / 2, dev_bloom2, dev_bloom1);
+
+	// upsample and composite
+	bloomComposite << < blockCount2d, blockSize2d >> > (width, height, dev_framebuffer, dev_bloom1);
+
+#endif
+
+
+	// HDR tonemap
+	toneMap << <blockCount2d, blockSize2d >> >(width, height, dev_framebuffer, 2.2f, 1.0f);
+	checkCUDAError("fragment shader");
+
     // Copy framebuffer into OpenGL buffer for OpenGL previewing
     sendImageToPBO<<<blockCount2d, blockSize2d>>>(pbo, width, height, dev_framebuffer);
     checkCUDAError("copy render result to pbo");
@@ -883,6 +1080,13 @@ void rasterizeFree() {
 
 	cudaFree(dev_fragMutex);
 	dev_fragMutex = NULL;
+
+#if BLOOM
+	cudaFree(dev_bloom1);
+	dev_bloom1 = NULL;
+	cudaFree(dev_bloom2);
+	dev_bloom2 = NULL;
+#endif
 
     checkCUDAError("rasterize Free");
 }
