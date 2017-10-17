@@ -18,8 +18,15 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
-
+/// Features
 #define BLOOM 1
+#define BLOOM2PASS 0
+#define BILINEAR 1
+#define USE_TEXTURES 1
+
+/// Constant Settings
+#define GAMMA 2.2f
+#define EXPOSURE 1.0f
 
 namespace {
 
@@ -39,18 +46,11 @@ namespace {
 
 	struct VertexOut {
 		glm::vec4 pos;
-
-		// TODO: add new attributes to your VertexOut
-		// The attributes listed below might be useful, 
-		// but always feel free to modify on your own
-
-		 glm::vec3 eyePos;	// eye space position used for shading
-		 glm::vec3 eyeNor;	// eye space normal used for shading, cuz normal will go wrong after perspective transformation
-		// glm::vec3 col;
-		 glm::vec2 texcoord0;
-		 TextureData* dev_diffuseTex = NULL;
-		// int texWidth, texHeight;
-		// ...
+		glm::vec3 eyePos;
+		glm::vec3 eyeNor;
+		glm::vec2 texcoord0;
+		TextureData* dev_diffuseTex = NULL;
+		int texWidth, texHeight;
 	};
 
 	struct Primitive {
@@ -62,9 +62,10 @@ namespace {
 		glm::vec3 color;
 		glm::vec3 eyePos;	// eye space position used for shading
 		glm::vec3 eyeNor;
-		// VertexAttributeTexcoord texcoord0;
-		// TextureData* dev_diffuseTex;
-		// ...
+		
+		glm::vec2 texcoord0;
+		TextureData* dev_diffuseTex;
+		int texWidth, texHeight;
 	};
 
 	struct PrimitiveDevBufPointers {
@@ -91,7 +92,6 @@ namespace {
 		// Vertex Out, vertex used for rasterization, this is changing every frame
 		VertexOut* dev_verticesOut;
 
-		// TODO: add more attributes when needed
 	};
 
 }
@@ -155,6 +155,47 @@ void toneMap(const int w, const int h, glm::vec3 *framebuffer, const float gamma
 	}
 }
 
+__device__ __host__
+glm::vec3 bytesToRGB(const TextureData* textureData, const int idx) {	
+	return glm::vec3(textureData[idx] / 255.f, textureData[idx + 1] / 255.f, textureData[idx + 2] / 255.f);
+}
+
+// get a texture color, 
+__device__ __host__
+glm::vec3 texture2D(const int w, const int h, const TextureData* textureData, const glm::vec2 UV) {
+	glm::vec2 uv = glm::mod(UV, glm::vec2(1.0f)); // repeat UV
+
+	float xf = floor(uv.x * w);
+	float yf = floor(uv.y * h);
+
+	int x = (int)xf;
+	int y = (int)yf;
+
+	glm::vec3 col;
+
+
+#if BILINEAR
+	float xw = uv.x * w - xf;
+	float yw = uv.y * h - yf;
+
+	glm::vec3 col00, col01, col10, col11;
+	col00 = bytesToRGB(textureData, 3 * (x + y * w));
+	col01 = bytesToRGB(textureData, 3 * (x + 1 + y * w));
+	col10 = bytesToRGB(textureData, 3 * (x + (y + 1) * w));
+	col11 = bytesToRGB(textureData, 3 * (x + 1 + (y + 1) * w));
+
+	col = yw * (xw * col00 + (1.f - xw) * col01) + (1.f - yw) * (xw * col10 + (1.f - xw) * col11);
+#else 
+	int idx = 3 * (x + y * w);
+	col = bytesToRGB(textureData, idx);
+#endif
+
+	// apply gamma correction
+	col = glm::pow(col, glm::vec3(GAMMA));
+
+	return col;
+}
+
 #if BLOOM
 
 // check for color components above 1, transfer to buffer with half res
@@ -177,35 +218,18 @@ void bloomHighPass(int wHalf, int hHalf, const glm::vec3 *framebuffer, glm::vec3
 
 				float intensity = dot(fbCol, fbCol);
 				intensity -= 3.f; // threshold
-				intensity *= 0.5f; // stretch response curve
-				intensity = intensity < 0.f ? 0.f : intensity;
+				//intensity *= 0.5f; // stretch response curve
+				intensity = intensity < 0.f ? 0.f : intensity; // clamp
 				intensity = intensity > 1.f ? 1.f : intensity;
 
 				intensity = intensity * intensity * (3.f - 2.f * intensity); // smoothstep
-				/*
-	// Scale, bias and saturate x to 0..1 range
-    x = clamp((x - edge0)/(edge1 - edge0), 0.0, 1.0); 
-    // Evaluate polynomial
-    return x*x*(3 - 2*x);
-	*/
 
-				fbCol = intensity * fbCol;
-
-				col += 0.25f * fbCol;
+				col += 0.25f * intensity * fbCol;
 			}
 		}
 		bloombuffer[bloomIdx] = col;
 	}
 }
-	//uniform float offset[3] = float[](0.0, 1.3846153846, 3.2307692308);
-	//uniform float weight[3] = float[](0.2270270270, 0.3162162162, 0.0702702703);
-
-
-/*	uniform float offset[5] = float[]( 0.0, 1.0, 2.0, 3.0, 4.0 );
-06
-	uniform float weight[5] = float[]( 0.2270270270, 0.1945945946, 0.1216216216,
-07
-	                                   0.0540540541, 0.0162162162 );*/
 
 __global__
 void bloomHorizontalGather(int w, int h, const glm::vec3 *bufIn, glm::vec3 *bufOut) {
@@ -214,13 +238,11 @@ void bloomHorizontalGather(int w, int h, const glm::vec3 *bufIn, glm::vec3 *bufO
 	int idx = x + y * w;
 
 	if (x < w && y < h) {
-		// close approximation by Rastergrid, efficient gaussian blur with linear sampling
 		float weight[5] = { 0.227027027f, 0.194594595f, 0.121621622f, 0.054054054f, 0.016216216f};
-		int offset[5] = { 0, 1, 2, 3, 4 };
 		glm::vec3 col = bufIn[idx] * weight[0];
 		for (int i = 1; i < 5; i++) {
-			int prev = x - offset[i];
-			int next = x + offset[i];
+			int prev = x - i;
+			int next = x + i;
 			prev = prev < 0 ? 0 : prev;
 			next = next >= w ? w - 1 : next;
 
@@ -239,13 +261,11 @@ void bloomVerticalGather(int w, int h, const glm::vec3 *bufIn, glm::vec3 *bufOut
 	int idx = x + y * w;
 
 	if (x < w && y < h) {
-		// close approximation by Rastergrid, efficient gaussian blur with linear sampling
 		float weight[5] = { 0.227027027f, 0.194594595f, 0.121621622f, 0.054054054f, 0.016216216f };
-		int offset[5] = { 0, 1, 2, 3, 4 };
 		glm::vec3 col = bufIn[idx] * weight[0];
 		for (int i = 1; i < 5; i++) {
-			int prev = y - offset[i];
-			int next = y + offset[i];
+			int prev = y - i;
+			int next = y + i;
 			prev = prev < 0 ? 0 : prev;
 			next = next >= h ? h - 1 : next;
 
@@ -259,14 +279,14 @@ void bloomVerticalGather(int w, int h, const glm::vec3 *bufIn, glm::vec3 *bufOut
 
 __global__
 void bloomComposite(int w, int h, glm::vec3 *framebuffer, const glm::vec3 *bloombuffer) {
-	// going to "bilinear upsample" the bloomBuffer to get composite color
+	// going to bilinear upsample the bloomBuffer to get composite color
 	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
 	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
 	int idx = x + y * w;
 
 	if (x < w && y < h) {
 		// get 4 samples of bloom buffer and interpolate
-		// if the current px is odd, it's in latter half
+		// if the current px is odd, it's in latter half of x / y of pixel
 		float wx = x & 1 ? 0.75f : 0.25f;
 		float wy = y & 1 ? 0.75f : 0.25f;
 
@@ -274,8 +294,8 @@ void bloomComposite(int w, int h, glm::vec3 *framebuffer, const glm::vec3 *bloom
 		int hb = h / 2;
 		int xb = x / 2;
 		int yb = y / 2;
-		int idxb = xb + yb * wb;
 
+		// quadrant offset
 		int x0 = x & 1 ? (xb) : (xb > 0 ? xb - 1 : 0);
 		int x1 = x & 1 ? (xb >= (wb - 1) ? wb - 1 : xb + 1) : (xb);
 
@@ -306,7 +326,6 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
     int index = x + (y * w);
 
     if (x < w && y < h) {
-        //framebuffer[index] = fragmentBuffer[index].color;
 		if (glm::length(fragmentBuffer[index].color) < 0.0001f) {
 			framebuffer[index] = glm::vec3(0);
 			return;
@@ -328,12 +347,24 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
 			glm::vec3(0.4f, 1.0f, 0.5f)
 		};
 
+		glm::vec3 matDiffuse;
+#if USE_TEXTURES
+		if (fragmentBuffer[index].dev_diffuseTex != NULL) {
+			matDiffuse = texture2D(fragmentBuffer[index].texWidth, fragmentBuffer[index].texHeight,
+				fragmentBuffer[index].dev_diffuseTex, fragmentBuffer[index].texcoord0);
+			matDiffuse = glm::max(matDiffuse, glm::vec3(0.05f));
+		}
+		else {
+			matDiffuse = glm::vec3(0.75f);
+		}
+#else 
+		matDiffuse = glm::vec3(0.75f);
+#endif
 
 		// simple blinn phong
 		glm::vec3 col = glm::vec3(0);
 		glm::vec3 nor = fragmentBuffer[index].eyeNor;
-		//glm::vec3 lightPos = glm::vec3(5, 5, 5);
-		//glm::vec3 lightDir = glm::normalize(lightPos - fragmentBuffer[index].eyePos);
+
 		for (int i = 0; i < 3; i++) {
 			glm::vec3 halfVec = glm::normalize(lightDir[i] - glm::normalize(fragmentBuffer[index].eyePos));
 
@@ -342,7 +373,7 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
 			float blinn = pow(glm::dot(halfVec, nor), 64.0f);
 			blinn = blinn < 0 ? 0 : blinn;
 
-			col += lightIntensity[i] * lightCol[i] * glm::vec3(blinn + lambert);
+			col += lightIntensity[i] * lightCol[i] * (glm::vec3(blinn) + matDiffuse * lambert);
 		}
 
 		framebuffer[index] = col;
@@ -840,8 +871,6 @@ void rasterizeSetBuffers(const tinygltf::Scene & scene) {
 
 		checkCUDAError("Free BufferView Device Mem");
 	}
-
-
 }
 
 
@@ -866,12 +895,22 @@ void _vertexTransformAndAssembly(
 		// Finally transform x and y to viewport space
 		posTransformed.x = 0.5f * (posTransformed.x + 1.0f) * width;
 		posTransformed.y = 0.5f * (-posTransformed.y + 1.0f) * height;
-		//posTransformed.z = 0.5f * (posTransformed.z + 1.0f); // closer points get smaller z
 
 		primitive.dev_verticesOut[vid].pos = posTransformed; // screen position
 		primitive.dev_verticesOut[vid].eyeNor = glm::normalize(MV_normal * primitive.dev_normal[vid]);
 		primitive.dev_verticesOut[vid].eyePos = glm::vec3(MV * posIn); // view position for lighting
-		
+
+#if USE_TEXTURES
+		if (primitive.dev_diffuseTex != NULL) {
+			primitive.dev_verticesOut[vid].dev_diffuseTex = primitive.dev_diffuseTex;
+			primitive.dev_verticesOut[vid].texcoord0 = primitive.dev_texcoord0[vid];
+			primitive.dev_verticesOut[vid].texHeight = primitive.diffuseTexHeight;
+			primitive.dev_verticesOut[vid].texWidth = primitive.diffuseTexWidth;
+		}
+		else {
+			primitive.dev_verticesOut[vid].dev_diffuseTex = NULL;
+		}
+#endif
 	}
 }
 
@@ -925,26 +964,42 @@ __global__ void _rasterizeTriangle(const int numTris, const Primitive* primitive
 			glm::vec3 interPos = getPerspectiveInterpolatedVector(bary, triPos, tri, zPersp);
 
 			int depth = (int)( getZAtCoordinate(bary, tri) * INT_MAX);
-			// hacky cull backface
-			if (glm::dot(interNor, glm::vec3(0, 0, 1)) > 0 && depth < depthBuffer[pxIdx]) {
+			
+			bool isSet;
+			do {
+				isSet = (atomicCAS(&mutex[pxIdx], 0, 1) == 0);
+				if (isSet) {
+					if (depthBuffer[pxIdx] > depth) {
+						// replaced fragment with this triangle
+						frags[pxIdx].color = interNor;
+						frags[pxIdx].eyeNor = interNor;
+						frags[pxIdx].eyePos = interPos;
+						depthBuffer[pxIdx] = depth;
 
-				bool isSet;
-				do {
-					isSet = (atomicCAS(&mutex[pxIdx], 0, 1) == 0);
-					if (isSet) {
-						if (depthBuffer[pxIdx] > depth) {
-							// replaced fragment with this triangle
-							frags[pxIdx].color = interNor;
-							frags[pxIdx].eyeNor = interNor;
-							frags[pxIdx].eyePos = interPos;
-							depthBuffer[pxIdx] = depth;
-						}				
-					}
-					if (isSet) {
-						mutex[pxIdx] = 0;
-					}
-				} while (!isSet);
-			}
+#if USE_TEXTURES
+						if (pri.v[0].dev_diffuseTex != NULL) {
+							glm::vec3 triUV[3] = {
+								glm::vec3(pri.v[0].texcoord0, 0.f),
+								glm::vec3(pri.v[1].texcoord0, 0.f),
+								glm::vec3(pri.v[2].texcoord0, 0.f)
+							};
+							glm::vec2 interUV = glm::vec2(getPerspectiveInterpolatedVector(bary, triUV, tri, zPersp));
+
+							frags[pxIdx].dev_diffuseTex = pri.v[0].dev_diffuseTex;
+							frags[pxIdx].texcoord0 = interUV;
+							frags[pxIdx].texHeight = pri.v[0].texHeight;
+							frags[pxIdx].texWidth = pri.v[0].texWidth;
+						}
+						else {
+							frags[pxIdx].dev_diffuseTex = NULL;
+						}
+						
+#endif
+					}	
+					mutex[pxIdx] = 0;
+				}
+			} while (!isSet);
+			
 		}
 	}
 }
@@ -957,10 +1012,6 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
     dim3 blockSize2d(sideLength2d, sideLength2d);
     dim3 blockCount2d((width  - 1) / blockSize2d.x + 1,
 		(height - 1) / blockSize2d.y + 1);
-
-
-	// Execute your rasterization pipeline here
-	// (See README for rasterization pipeline outline.)
 
 	// Vertex Process & primitive assembly
 	{
@@ -1018,12 +1069,16 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	dim3 blockDownsampleCount2d((width / 2 - 1) / blockSize2d.x + 1,
 		(height / 2 - 1) / blockSize2d.y + 1);
 
-	// void bloomHighPass(int wHalf, int hHalf, glm::vec3 *framebuffer, glm::vec3 *bloombuffer) {
 	bloomHighPass << < blockDownsampleCount2d, blockSize2d >> > (width / 2, height / 2, dev_framebuffer, dev_bloom1);
 
 	// apply gaussian
 	bloomHorizontalGather << < blockDownsampleCount2d, blockSize2d >> >(width / 2, height / 2, dev_bloom1, dev_bloom2);
 	bloomVerticalGather << < blockDownsampleCount2d, blockSize2d >> >(width / 2, height / 2, dev_bloom2, dev_bloom1);
+
+#if BLOOM2PASS
+	bloomHorizontalGather << < blockDownsampleCount2d, blockSize2d >> >(width / 2, height / 2, dev_bloom1, dev_bloom2);
+	bloomVerticalGather << < blockDownsampleCount2d, blockSize2d >> >(width / 2, height / 2, dev_bloom2, dev_bloom1);
+#endif
 
 	// upsample and composite
 	bloomComposite << < blockCount2d, blockSize2d >> > (width, height, dev_framebuffer, dev_bloom1);
@@ -1032,7 +1087,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 
 
 	// HDR tonemap
-	toneMap << <blockCount2d, blockSize2d >> >(width, height, dev_framebuffer, 2.2f, 1.0f);
+	toneMap << <blockCount2d, blockSize2d >> >(width, height, dev_framebuffer, GAMMA, EXPOSURE);
 	checkCUDAError("fragment shader");
 
     // Copy framebuffer into OpenGL buffer for OpenGL previewing
