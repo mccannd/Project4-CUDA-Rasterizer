@@ -26,7 +26,7 @@
 
 /// Constant Settings
 #define GAMMA 2.2f
-#define EXPOSURE 1.0f
+#define EXPOSURE 1.5f
 
 namespace {
 
@@ -184,7 +184,7 @@ glm::vec3 texture2D(const int w, const int h, const TextureData* textureData, co
 	col10 = bytesToRGB(textureData, 3 * (x + (y + 1) * w));
 	col11 = bytesToRGB(textureData, 3 * (x + 1 + (y + 1) * w));
 
-	col = yw * (xw * col00 + (1.f - xw) * col01) + (1.f - yw) * (xw * col10 + (1.f - xw) * col11);
+	col = (1.f - yw) * ((1.f - xw) * col00 + xw * col01) + yw * ((1.f - xw) * col10 + xw * col11);
 #else 
 	int idx = 3 * (x + y * w);
 	col = bytesToRGB(textureData, idx);
@@ -218,7 +218,7 @@ void bloomHighPass(int wHalf, int hHalf, const glm::vec3 *framebuffer, glm::vec3
 
 				float intensity = dot(fbCol, fbCol);
 				intensity -= 3.f; // threshold
-				//intensity *= 0.5f; // stretch response curve
+				intensity *= 0.5f; // stretch response curve
 				intensity = intensity < 0.f ? 0.f : intensity; // clamp
 				intensity = intensity > 1.f ? 1.f : intensity;
 
@@ -370,7 +370,7 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
 
 			float lambert = glm::dot(nor, lightDir[i]);
 			lambert = lambert < 0 ? 0 : lambert;
-			float blinn = pow(glm::dot(halfVec, nor), 64.0f);
+			float blinn = pow(glm::dot(halfVec, nor), 32.0f);
 			blinn = blinn < 0 ? 0 : blinn;
 
 			col += lightIntensity[i] * lightCol[i] * (glm::vec3(blinn) + matDiffuse * lambert);
