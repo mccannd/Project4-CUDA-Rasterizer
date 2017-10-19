@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cuda.h>
+#include <chrono>
 #include <cuda_runtime.h>
 #include <thrust/random.h>
 #include <util/checkCUDAError.h>
@@ -1004,6 +1005,8 @@ __global__ void _rasterizeTriangle(const int numTris, const Primitive* primitive
 	}
 }
 
+int ech = 0;
+
 /**
  * Perform rasterization.
  */
@@ -1012,6 +1015,8 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
     dim3 blockSize2d(sideLength2d, sideLength2d);
     dim3 blockCount2d((width  - 1) / blockSize2d.x + 1,
 		(height - 1) / blockSize2d.y + 1);
+
+	
 
 	// Vertex Process & primitive assembly
 	{
@@ -1044,6 +1049,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 
 		checkCUDAError("Vertex Processing and Primitive Assembly");
 	}
+
 	
 	cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
 	initDepth << <blockCount2d, blockSize2d >> >(width, height, dev_depth);
@@ -1058,11 +1064,11 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 		dev_depth, width, height, dev_fragMutex);
 	checkCUDAError("rasterize tris");
 
-	
-
     // Copy depthbuffer colors into framebuffer
 	render << <blockCount2d, blockSize2d >> >(width, height, dev_fragmentBuffer, dev_framebuffer);
 	checkCUDAError("fragment shader");
+
+
 
 #if BLOOM
 	// make downsampled high pass
@@ -1084,7 +1090,6 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	bloomComposite << < blockCount2d, blockSize2d >> > (width, height, dev_framebuffer, dev_bloom1);
 
 #endif
-
 
 	// HDR tonemap
 	toneMap << <blockCount2d, blockSize2d >> >(width, height, dev_framebuffer, GAMMA, EXPOSURE);
